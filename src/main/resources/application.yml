@@ -1,0 +1,37 @@
+server:
+  port: 8080 # 网关服务的暴露端口
+
+spring:
+  application:
+    name: tx-sentry
+
+  # 1. PostgreSQL (Citus) 数据源配置
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    # 连接你本地 WSL 2 / Docker 暴露出的 5432 端口
+    url: jdbc:postgresql://localhost:5432/tx_sentinel
+    username: postgres
+    password: postgres_password
+    hikari:
+      minimum-idle: 5
+      maximum-pool-size: 20 # 高并发网关需要稍大的连接池
+      connection-timeout: 30000
+
+  # 2. Redis 分布式锁/缓存配置
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      database: 0
+      timeout: 3000ms
+
+# 3. MyBatis 配置 (开启驼峰命名自动映射)
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+
+# 日志打印级别：开发阶段打开 DEBUG 方便排查底层 SQL
+logging:
+  level:
+    com.web3.txsentry: debug
