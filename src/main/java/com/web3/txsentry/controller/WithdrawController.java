@@ -1,8 +1,8 @@
 package com.web3.txsentry.controller;
 
 import com.web3.txsentry.annotation.Idempotent;
+import com.web3.txsentry.dto.WithdrawRequest;
 import com.web3.txsentry.service.WithdrawService;
-import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -30,10 +30,4 @@ public class WithdrawController {
         String result = withdrawService.processWithdrawal(bizOrderId, request.getToAddress(), request.getAmount());
         return ResponseEntity.ok(result);
     }
-}
-
-@Data
-class WithdrawRequest {
-    private String toAddress;
-    private BigDecimal amount;
 }

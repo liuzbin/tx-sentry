@@ -1,37 +1,37 @@
 server:
-  port: 8080 # Íø¹Ø·şÎñµÄ±©Â¶¶Ë¿Ú
+  port: 8080
 
 spring:
   application:
     name: tx-sentry
 
-  # 1. PostgreSQL (Citus) Êı¾İÔ´ÅäÖÃ
   datasource:
-    driver-class-name: org.postgresql.Driver
-    # Á¬½ÓÄã±¾µØ WSL 2 / Docker ±©Â¶³öµÄ 5432 ¶Ë¿Ú
-    url: jdbc:postgresql://localhost:5432/tx_sentinel
-    username: postgres
-    password: postgres_password
-    hikari:
-      minimum-idle: 5
-      maximum-pool-size: 20 # ¸ß²¢·¢Íø¹ØĞèÒªÉÔ´óµÄÁ¬½Ó³Ø
-      connection-timeout: 30000
+    citus:
+      jdbc-url: jdbc:postgresql://citus-coordinator:5432/tx_sentry
+      username: postgres
+      password: your_password
+      driver-class-name: org.postgresql.Driver
+      hikari:
+        maximum-pool-size: 60
+        minimum-idle: 10
+        connection-timeout: 30000
 
-  # 2. Redis ·Ö²¼Ê½Ëø/»º´æÅäÖÃ
   data:
     redis:
-      host: localhost
+      host: 127.0.0.1
       port: 6379
-      database: 0
-      timeout: 3000ms
+      password:
 
-# 3. MyBatis ÅäÖÃ (¿ªÆôÍÕ·åÃüÃû×Ô¶¯Ó³Éä)
 mybatis:
   mapper-locations: classpath:mapper/*.xml
   configuration:
     map-underscore-to-camel-case: true
 
-# ÈÕÖ¾´òÓ¡¼¶±ğ£º¿ª·¢½×¶Î´ò¿ª DEBUG ·½±ãÅÅ²éµ×²ã SQL
 logging:
   level:
     com.web3.txsentry: debug
+
+web3:
+  rpc-url: https://mainnet.infura.io/v3/YOUR_PROJECT_ID
+  private-key: ${WALLET_PRIVATE_KEY} # å¹³å°çƒ­é’±åŒ…ç§é’¥
+  chain-id: 1 # ä»¥å¤ªåŠä¸»ç½‘ä¸º 1ï¼ŒGoerli ä¸º 5
