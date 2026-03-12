@@ -53,22 +53,33 @@ public class WithdrawAsyncExecutor {
         String bizOrderId = order.getBizOrderId();
 
         try {
-            // a. load credentials securely in memory
+            // 1. load credentials securely in memory
             Credentials credentials = Credentials.create(privateKey);
             String hotWalletAddress = credentials.getAddress();
 
-            // b. acquire a strictly sequential nonce from our distributed redis lock service
-            long nonce = nonceService.getNextNonce(hotWalletAddress);
-
-            // c. fetch current gas price (can be optimized later for dynamic gas bumps)
+            // 2. fetch current gas price
             EthGasPrice ethGasPrice = web3j.ethGasPrice().send();
             BigInteger gasPrice = ethGasPrice.getGasPrice();
 
-            // d. dynamically build the raw transaction based on token type
-            RawTransaction rawTransaction = buildRawTransaction(order, nonce, gasPrice);
+            // 3. dynamically build the raw transaction based on token type
+            // First obtain the gas price, then build the transaction to prevent nonce blocking caused by an error returned when estimating the gas price of the token.
+            RawTransaction rawTransactionWithoutNonce = buildRawTransactionWithoutNonce(order, gasPrice, hotWalletAddress);
 
-            // e. local ecdsa signature
-            byte[] signedMessage = TransactionEncoder.signMessage(rawTransaction, chainId, credentials);
+            // 4. acquire a strictly sequential nonce from our distributed redis lock service
+            long nonce = nonceService.getNextNonce(hotWalletAddress);
+
+            // 5. Inject Nonce into the transaction object
+            RawTransaction finalRawTransaction = RawTransaction.createTransaction(
+                    BigInteger.valueOf(nonce),
+                    rawTransactionWithoutNonce.getGasPrice(),
+                    rawTransactionWithoutNonce.getGasLimit(),
+                    rawTransactionWithoutNonce.getTo(),
+                    rawTransactionWithoutNonce.getValue(),
+                    rawTransactionWithoutNonce.getData()
+            );
+
+            // 6. local ecdsa signature
+            byte[] signedMessage = TransactionEncoder.signMessage(finalRawTransaction, chainId, credentials);
             String hexValue = Numeric.toHexString(signedMessage);
 
             // f. broadcast to the network
@@ -99,7 +110,7 @@ public class WithdrawAsyncExecutor {
     /**
      * private router to construct the correct transaction payload (ETH vs ERC-20)
      */
-    private RawTransaction buildRawTransaction(WithdrawOrder order, long nonce, BigInteger gasPrice) {
+    private RawTransaction buildRawTransactionWithoutNonce(WithdrawOrder order, BigInteger gasPrice, String hotWalletAddress) {
         String tokenAddress = order.getTokenAddress();
         String toAddress = order.getToAddress();
 
@@ -109,7 +120,7 @@ public class WithdrawAsyncExecutor {
             BigInteger gasLimit = BigInteger.valueOf(21000L);
 
             return RawTransaction.createEtherTransaction(
-                    BigInteger.valueOf(nonce),
+                    BigInteger.ZERO,  // placeholder
                     gasPrice,
                     gasLimit,
                     toAddress,
@@ -130,17 +141,59 @@ public class WithdrawAsyncExecutor {
             );
 
             String encodedFunction = FunctionEncoder.encode(function);
-            BigInteger gasLimit = BigInteger.valueOf(100000L); // safe limit for contract calls
+
+            // Dynamically Estimating Gas Limit
+            BigInteger dynamicGasLimit = estimateSmartContractGas(hotWalletAddress, tokenAddress, encodedFunction);
 
             // transaction to the contract address, with 0 eth value, and payload data
             return RawTransaction.createTransaction(
-                    BigInteger.valueOf(nonce),
+                    BigInteger.ZERO,
                     gasPrice,
-                    gasLimit,
+                    dynamicGasLimit,
                     tokenAddress,
                     BigInteger.ZERO,
                     encodedFunction
             );
+        }
+    }
+
+    /**
+     * Gas estimation engine. Sends simulated execution requests to Ethereum nodes, with added security redundancy.
+     */
+    private BigInteger estimateSmartContractGas(String fromAddress, String contractAddress, String data) {
+        try {
+            // 注意：这里使用的是 request 包下的 Transaction，它是一个用于只读查询/模拟执行的只读对象
+            org.web3j.protocol.core.methods.request.Transaction estimateTx =
+                    org.web3j.protocol.core.methods.request.Transaction.createEthCallTransaction(
+                            fromAddress,
+                            contractAddress,
+                            data
+                    );
+
+            // 发起 RPC 模拟请求
+            org.web3j.protocol.core.methods.response.EthEstimateGas estimateResponse =
+                    web3j.ethEstimateGas(estimateTx).send();
+
+            if (estimateResponse.hasError()) {
+                // 如果估算报错，大概率是因为热钱包里的 USDT 余额不足，或者合约黑名单拦截，这笔交易如果发出去，必定 Revert
+                log.warn("Gas estimation failed (transaction will likely revert). Error: {}", estimateResponse.getError().getMessage());
+                throw new RuntimeException("Gas estimation failed, transaction will revert: " + estimateResponse.getError().getMessage());
+            }
+
+            // 获取节点给出的极度精确的模拟消耗值
+            BigInteger exactEstimatedGas = estimateResponse.getAmountUsed();
+
+            // 乘以 1.2 的缓冲系数 (Buffer)，保证上链时的绝对安全
+            BigDecimal bufferedGas = new BigDecimal(exactEstimatedGas).multiply(new BigDecimal("1.2"));
+
+            log.info("Dynamic gas estimated: exact {}, buffered {}", exactEstimatedGas, bufferedGas.toBigInteger());
+
+            return bufferedGas.toBigInteger();
+
+        } catch (Exception e) {
+            log.error("Network error during gas estimation, falling back to default limit.", e);
+            // 节点网络抖动时的降级策略
+            return BigInteger.valueOf(100000L);
         }
     }
 }
