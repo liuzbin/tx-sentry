@@ -30,5 +30,31 @@
         from withdraw_order
         where biz_order_id = #{bizOrderId}
     </select>
+    <select id="selectStuckOrders" resultType="com.web3.txsentry.entity.WithdrawOrder">
+        SELECT id, biz_order_id as bizOrderId, to_address as toAddress, token_address as tokenAddress,
+               amount, status, tx_hash as txHash, nonce, create_time as createTime, update_time as updateTime
+        FROM withdraw_order
+        WHERE status = #{status}
+          AND update_time &lt; #{thresholdTime}
+    </select>
 
+    <update id="updateTxHashForSpeedUp">
+        UPDATE withdraw_order
+        SET tx_hash = #{newTxHash},
+            update_time = NOW()
+        WHERE biz_order_id = #{bizOrderId}
+    </update>
+    <select id="selectByStatus" resultType="com.web3.txsentry.entity.WithdrawOrder">
+        select id,
+               biz_order_id as bizOrderId,
+               to_address as toAddress,
+               amount,
+               status,
+               tx_hash as txHash,
+               nonce,
+               create_time as createTime,
+               update_time as updateTime
+        from withdraw_order
+        where status = #{status}
+    </select>
 </mapper>

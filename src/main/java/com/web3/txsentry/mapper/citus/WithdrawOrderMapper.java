@@ -4,6 +4,9 @@ import com.web3.txsentry.entity.WithdrawOrder;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 
+import java.time.LocalDateTime;
+import java.util.List;
+
 /**
  * mapper interface for withdraw orders.
  * highly optimized for citus distributed queries by enforcing bizorderid routing.
@@ -39,4 +42,19 @@ public interface WithdrawOrderMapper {
      * @return the withdraw order entity
      */
     WithdrawOrder selectByBizOrderId(@Param("bizOrderId") String bizOrderId);
+
+    /**
+     * select orders by their current status.
+     */
+    List<WithdrawOrder> selectByStatus(@Param("status") String status);
+
+    /**
+     * 查询长时间卡在 BROADCASTED 状态的订单
+     */
+    List<WithdrawOrder> selectStuckOrders(@Param("status") String status, @Param("thresholdTime") LocalDateTime thresholdTime);
+
+    /**
+     * 专门用于提价覆盖的更新方法（重置 update_time，替换 tx_hash）
+     */
+    void updateTxHashForSpeedUp(@Param("bizOrderId") String bizOrderId, @Param("newTxHash") String newTxHash);
 }
