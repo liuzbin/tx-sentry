@@ -27,7 +27,7 @@ public class WithdrawController {
             return ResponseEntity.badRequest().body("Amount must be greater than zero");
         }
 
-        String result = withdrawService.processWithdrawal(bizOrderId, request.getToAddress(), request.getAmount());
+        String result = withdrawService.processWithdrawal(bizOrderId, request.getToAddress(), request.getAmount(), request.getTokenAddress());
         return ResponseEntity.ok(result);
     }
 }

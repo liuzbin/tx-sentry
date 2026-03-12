@@ -27,11 +27,12 @@ public class WithdrawService {
      * this method executes within a database transaction.
      */
     @Transactional(rollbackFor = Exception.class)
-    public String processWithdrawal(String bizOrderId, String toAddress, BigDecimal amount) {
+    public String processWithdrawal(String bizOrderId, String toAddress, BigDecimal amount, String tokenAddress) {
 
         WithdrawOrder order = new WithdrawOrder();
         order.setBizOrderId(bizOrderId);
         order.setToAddress(toAddress);
+        order.setTokenAddress(tokenAddress);
         order.setAmount(amount);
         order.setStatus("PENDING");
 

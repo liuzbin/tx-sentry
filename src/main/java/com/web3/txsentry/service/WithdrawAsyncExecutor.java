@@ -7,6 +7,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Component;
+import org.web3j.abi.FunctionEncoder;
+import org.web3j.abi.datatypes.Address;
+import org.web3j.abi.datatypes.Function;
+import org.web3j.abi.datatypes.generated.Uint256;
 import org.web3j.crypto.Credentials;
 import org.web3j.crypto.RawTransaction;
 import org.web3j.crypto.TransactionEncoder;
@@ -18,10 +22,12 @@ import org.web3j.utils.Numeric;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.util.Arrays;
+import java.util.Collections;
 
 /**
  * dedicated asynchronous executor for web3 transactions.
- * separated from the main service to guarantee spring @async proxy mechanism functions correctly.
+ * fully supports both native eth and erc-20 token (e.g., usdt) transfers.
  */
 @Slf4j
 @Component
@@ -30,7 +36,7 @@ public class WithdrawAsyncExecutor {
 
     private final WithdrawOrderMapper withdrawMapper;
     private final Web3j web3j;
-    private final NonceService nonceService; // we will implement this next using redisson
+    private final NonceService nonceService;
 
     @Value("${web3.wallet.private-key}")
     private String privateKey;
@@ -39,10 +45,10 @@ public class WithdrawAsyncExecutor {
     private long chainId;
 
     /**
-     * 2. core execution: fetch nonce, sign locally, and broadcast.
+     * core execution: fetch nonce, sign locally, and broadcast.
      * runs in a separate thread pool managed by spring.
      */
-    @Async("web3AsyncThreadPool") // strongly recommend defining a specific thread pool for web3 IO
+    @Async("web3AsyncThreadPool")
     public void executeBlockchainBroadcast(WithdrawOrder order) {
         String bizOrderId = order.getBizOrderId();
 
@@ -54,22 +60,12 @@ public class WithdrawAsyncExecutor {
             // b. acquire a strictly sequential nonce from our distributed redis lock service
             long nonce = nonceService.getNextNonce(hotWalletAddress);
 
-            // c. fetch current gas price
+            // c. fetch current gas price (can be optimized later for dynamic gas bumps)
             EthGasPrice ethGasPrice = web3j.ethGasPrice().send();
             BigInteger gasPrice = ethGasPrice.getGasPrice();
-            BigInteger gasLimit = BigInteger.valueOf(21000L); // standard eth transfer limit
 
-            // d. construct the raw transaction using accurate wei conversion
-            BigDecimal amountInEther = order.getAmount();
-            BigInteger valueInWei = Convert.toWei(amountInEther, Convert.Unit.ETHER).toBigInteger();
-
-            RawTransaction rawTransaction = RawTransaction.createEtherTransaction(
-                    BigInteger.valueOf(nonce),
-                    gasPrice,
-                    gasLimit,
-                    order.getToAddress(),
-                    valueInWei
-            );
+            // d. dynamically build the raw transaction based on token type
+            RawTransaction rawTransaction = buildRawTransaction(order, nonce, gasPrice);
 
             // e. local ecdsa signature
             byte[] signedMessage = TransactionEncoder.signMessage(rawTransaction, chainId, credentials);
@@ -80,7 +76,6 @@ public class WithdrawAsyncExecutor {
 
             if (ethSendTransaction.hasError()) {
                 log.error("broadcast failed for order {}. error: {}", bizOrderId, ethSendTransaction.getError().getMessage());
-                // note: if failed, we must handle nonce rollback or mark as failed in db
                 withdrawMapper.updateStatusAndTxHash(bizOrderId, "FAILED", null);
                 return;
             }
@@ -98,6 +93,54 @@ public class WithdrawAsyncExecutor {
         } catch (Exception e) {
             log.error("critical execution error for order {}", bizOrderId, e);
             withdrawMapper.updateStatusAndTxHash(bizOrderId, "ERROR", null);
+        }
+    }
+
+    /**
+     * private router to construct the correct transaction payload (ETH vs ERC-20)
+     */
+    private RawTransaction buildRawTransaction(WithdrawOrder order, long nonce, BigInteger gasPrice) {
+        String tokenAddress = order.getTokenAddress();
+        String toAddress = order.getToAddress();
+
+        if (tokenAddress == null || tokenAddress.trim().isEmpty()) {
+            // branch a: native eth transfer
+            BigInteger valueInWei = Convert.toWei(order.getAmount(), Convert.Unit.ETHER).toBigInteger();
+            BigInteger gasLimit = BigInteger.valueOf(21000L);
+
+            return RawTransaction.createEtherTransaction(
+                    BigInteger.valueOf(nonce),
+                    gasPrice,
+                    gasLimit,
+                    toAddress,
+                    valueInWei
+            );
+        } else {
+            // branch b: erc-20 token transfer (e.g., usdt)
+            // warning: token decimals must be accurate. usdt is typically 6.
+            int tokenDecimals = 6;
+            BigDecimal multiplier = BigDecimal.valueOf(Math.pow(10, tokenDecimals));
+            BigInteger tokenAmountInLowestUnit = order.getAmount().multiply(multiplier).toBigInteger();
+
+            // abi encoding for transfer(address,uint256)
+            Function function = new Function(
+                    "transfer",
+                    Arrays.asList(new Address(toAddress), new Uint256(tokenAmountInLowestUnit)),
+                    Collections.emptyList()
+            );
+
+            String encodedFunction = FunctionEncoder.encode(function);
+            BigInteger gasLimit = BigInteger.valueOf(100000L); // safe limit for contract calls
+
+            // transaction to the contract address, with 0 eth value, and payload data
+            return RawTransaction.createTransaction(
+                    BigInteger.valueOf(nonce),
+                    gasPrice,
+                    gasLimit,
+                    tokenAddress,
+                    BigInteger.ZERO,
+                    encodedFunction
+            );
         }
     }
 }

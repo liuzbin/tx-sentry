@@ -5,8 +5,8 @@
 <mapper namespace="com.web3.txsentry.mapper.citus.WithdrawOrderMapper">
 
     <insert id="insertOrder" parameterType="com.web3.txsentry.entity.WithdrawOrder" useGeneratedKeys="true" keyProperty="id">
-        insert into withdraw_order (biz_order_id, to_address, amount, status, create_time, update_time)
-        values (#{bizOrderId}, #{toAddress}, #{amount}, #{status}, NOW(), NOW())
+        insert into withdraw_order (biz_order_id, to_address, token_address, amount, status, create_time, update_time)
+        values (#{bizOrderId}, #{toAddress}, #{tokenAddress}, #{amount}, #{status}, NOW(), NOW())
     </insert>
 
     <update id="updateStatusAndTxHash">

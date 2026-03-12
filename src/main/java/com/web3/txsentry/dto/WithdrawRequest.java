@@ -9,5 +9,6 @@ import java.math.BigDecimal;
 @Data
 public class WithdrawRequest {
     private String toAddress;
+    private String tokenAddress;
     private BigDecimal amount;
 }
