@@ -8,7 +8,9 @@ import java.math.BigDecimal;
  */
 @Data
 public class WithdrawRequest {
+    private String bizOrderId;
     private String toAddress;
     private String tokenAddress;
     private BigDecimal amount;
+    private boolean isUrgent = false;
 }

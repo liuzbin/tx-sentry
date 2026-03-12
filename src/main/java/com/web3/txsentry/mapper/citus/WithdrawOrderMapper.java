@@ -16,19 +16,11 @@ public interface WithdrawOrderMapper {
 
     /**
      * insert a new withdraw order.
-     * citus will automatically hash the bizorderid to place it on the correct worker node.
-     *
-     * @param order the withdraw order entity
      */
     void insertOrder(WithdrawOrder order);
 
     /**
-     * update the transaction status and tx hash.
-     * strictly requires bizorderid to avoid cross-shard broadcasting in citus.
-     *
-     * @param bizOrderId the unique business order id (shard key)
-     * @param status     the new status
-     * @param txHash     the transaction hash (can be null if failed)
+     * update the transaction status and tx hash. (Used by Single Send)
      */
     void updateStatusAndTxHash(@Param("bizOrderId") String bizOrderId,
                                @Param("status") String status,
@@ -36,20 +28,16 @@ public interface WithdrawOrderMapper {
 
     /**
      * query an order by its shard key.
-     * this ensures a pure point-lookup routed to a single worker node.
-     *
-     * @param bizOrderId the unique business order id (shard key)
-     * @return the withdraw order entity
      */
     WithdrawOrder selectByBizOrderId(@Param("bizOrderId") String bizOrderId);
 
     /**
-     * select orders by their current status.
+     * select orders by their current status. (Used by TxMonitorJob)
      */
     List<WithdrawOrder> selectByStatus(@Param("status") String status);
 
     /**
-     * 查询长时间卡在 BROADCASTED 状态的订单
+     * 查询长时间卡在 BROADCASTED 状态的订单 (Used by StuckNonceMonitorJob)
      */
     List<WithdrawOrder> selectStuckOrders(@Param("status") String status, @Param("thresholdTime") LocalDateTime thresholdTime);
 
@@ -57,4 +45,29 @@ public interface WithdrawOrderMapper {
      * 专门用于提价覆盖的更新方法（重置 update_time，替换 tx_hash）
      */
     void updateTxHashForSpeedUp(@Param("bizOrderId") String bizOrderId, @Param("newTxHash") String newTxHash);
+
+    // ==========================================
+    // 批量聚合打包 (Batch) 专属的高级状态机接口
+    // ==========================================
+
+    /**
+     * 阶段一：悲观锁抓取 PENDING_BATCH 订单，跳过已被锁定的行。
+     */
+    List<WithdrawOrder> selectPendingBatchOrdersWithLock(@Param("limit") int limit);
+
+    /**
+     * 通用的批量状态跃迁方法 (用于切换至 PROCESSING_BATCH 或回滚至 PENDING_BATCH)
+     */
+    int updateStatusBatch(@Param("bizOrderIds") List<String> bizOrderIds, @Param("newStatus") String newStatus);
+
+    /**
+     * 阶段二：成功上链后，将这批订单的状态统一更新为 BROADCASTED，并死死绑定同一个聚合母 TxHash。
+     */
+    int batchUpdateToBroadcasted(@Param("bizOrderIds") List<String> bizOrderIds, @Param("txHash") String txHash);
+
+    /**
+     * 灾难恢复：清理因为服务器宕机而变成僵尸的 PROCESSING_BATCH 订单。
+     * 将卡住超过 5 分钟的订单，重新打回 PENDING_BATCH 队列。
+     */
+    int recoverZombieProcessingOrders();
 }

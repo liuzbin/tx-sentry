@@ -27,7 +27,15 @@ public class WithdrawController {
             return ResponseEntity.badRequest().body("Amount must be greater than zero");
         }
 
-        String result = withdrawService.processWithdrawal(bizOrderId, request.getToAddress(), request.getAmount(), request.getTokenAddress());
+        // 仅仅向核心中枢透传 request.isUrgent() 这个路由控制因子
+        String result = withdrawService.processWithdrawal(
+                bizOrderId,
+                request.getToAddress(),
+                request.getAmount(),
+                request.getTokenAddress(),
+                request.isUrgent()
+        );
+
         return ResponseEntity.ok(result);
     }
 }

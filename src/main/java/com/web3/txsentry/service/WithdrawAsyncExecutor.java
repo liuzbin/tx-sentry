@@ -1,12 +1,16 @@
 package com.web3.txsentry.service;
 
+import com.web3.txsentry.constant.TokenDictionary;
 import com.web3.txsentry.entity.WithdrawOrder;
+import com.web3.txsentry.event.WithdrawSingleEvent;
 import com.web3.txsentry.mapper.citus.WithdrawOrderMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.event.TransactionPhase;
+import org.springframework.transaction.event.TransactionalEventListener;
 import org.web3j.abi.FunctionEncoder;
 import org.web3j.abi.datatypes.Address;
 import org.web3j.abi.datatypes.Function;
@@ -37,6 +41,7 @@ public class WithdrawAsyncExecutor {
     private final WithdrawOrderMapper withdrawMapper;
     private final Web3j web3j;
     private final NonceService nonceService;
+    private final TokenDictionary tokenDictionary;
 
     @Value("${web3.wallet.private-key}")
     private String privateKey;
@@ -45,10 +50,20 @@ public class WithdrawAsyncExecutor {
     private long chainId;
 
     /**
-     * core execution: fetch nonce, sign locally, and broadcast.
-     * runs in a separate thread pool managed by spring.
+     * 【核心改动】：监听事件。
+     * AFTER_COMMIT 保证了只有当 WithdrawService 的事务成功落库后，这里才会执行。防止幻读。
      */
     @Async("web3AsyncThreadPool")
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void onSingleWithdrawEvent(WithdrawSingleEvent event) {
+        WithdrawOrder order = event.getOrder();
+        executeBlockchainBroadcast(order);
+    }
+
+
+    /**
+     * core execution: fetch nonce, sign locally, and broadcast.
+     */
     public void executeBlockchainBroadcast(WithdrawOrder order) {
         String bizOrderId = order.getBizOrderId();
 
@@ -129,7 +144,7 @@ public class WithdrawAsyncExecutor {
         } else {
             // branch b: erc-20 token transfer (e.g., usdt)
             // warning: token decimals must be accurate. usdt is typically 6.
-            int tokenDecimals = 6;
+            int tokenDecimals = tokenDictionary.getDecimals(tokenAddress);
             BigDecimal multiplier = BigDecimal.valueOf(Math.pow(10, tokenDecimals));
             BigInteger tokenAmountInLowestUnit = order.getAmount().multiply(multiplier).toBigInteger();
 
@@ -195,5 +210,49 @@ public class WithdrawAsyncExecutor {
             // 节点网络抖动时的降级策略
             return BigInteger.valueOf(100000L);
         }
+    }
+
+    /**
+     * 专门为聚合打包(或预编码报文)提供的底层发送通道。
+     * 直接接收 data，动态估算 Gas 并上链。
+     */
+    public String executeBatchBroadcast(WithdrawOrder motherOrder, String encodedData) throws Exception {
+        Credentials credentials = Credentials.create(privateKey);
+        String hotWalletAddress = credentials.getAddress();
+
+        BigInteger gasPrice = web3j.ethGasPrice().send().getGasPrice();
+
+        // 1. 动态估算这个巨大数组跑完 for 循环到底需要多少 Gas
+        BigInteger dynamicGasLimit = estimateSmartContractGas(
+                hotWalletAddress,
+                motherOrder.getToAddress(),
+                encodedData
+        );
+
+        // 2. 绝对安全区：获取 Nonce
+        long nonce = nonceService.getNextNonce(hotWalletAddress);
+
+        // 3. 组装最终报文
+        RawTransaction rawTransaction = RawTransaction.createTransaction(
+                BigInteger.valueOf(nonce),
+                gasPrice,
+                dynamicGasLimit,
+                motherOrder.getToAddress(), // Dispenser 合约地址
+                BigInteger.ZERO,
+                encodedData
+        );
+
+        // 4. 签名与广播
+        byte[] signedMessage = TransactionEncoder.signMessage(rawTransaction, chainId, credentials);
+        String hexValue = Numeric.toHexString(signedMessage);
+
+        org.web3j.protocol.core.methods.response.EthSendTransaction ethSendTransaction =
+                web3j.ethSendRawTransaction(hexValue).send();
+
+        if (ethSendTransaction.hasError()) {
+            throw new RuntimeException("Batch broadcast failed: " + ethSendTransaction.getError().getMessage());
+        }
+
+        return ethSendTransaction.getTransactionHash();
     }
 }

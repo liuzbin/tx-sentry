@@ -11,7 +11,8 @@ public class WithdrawOrder {
     private String toAddress;       // 提现目标地址
     private String tokenAddress;    // 如果非空，则表示提现的是代币，否则则为原生币
     private BigDecimal amount;      // 提现金额
-    private String status;          // 状态: PENDING, BROADCASTED, CONFIRMED, FAILED
+    private Boolean isUrgent;       // 记录该笔订单的原始加急意图
+    private String status;          // 状态: PENDING, BROADCASTED, CONFIRMED, FAILED TODO: 更换为枚举
     private String txHash;          // 链上交易哈希
     private Long nonce;             // 该笔交易使用的 Nonce
     private LocalDateTime createTime;

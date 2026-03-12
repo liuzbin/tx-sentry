@@ -21,6 +21,7 @@
         select id,
                biz_order_id as bizOrderId,
                to_address as toAddress,
+               token_address as tokenAddress,
                amount,
                status,
                tx_hash as txHash,
@@ -30,6 +31,22 @@
         from withdraw_order
         where biz_order_id = #{bizOrderId}
     </select>
+
+    <select id="selectByStatus" resultType="com.web3.txsentry.entity.WithdrawOrder">
+        select id,
+               biz_order_id as bizOrderId,
+               to_address as toAddress,
+               token_address as tokenAddress,
+               amount,
+               status,
+               tx_hash as txHash,
+               nonce,
+               create_time as createTime,
+               update_time as updateTime
+        from withdraw_order
+        where status = #{status}
+    </select>
+
     <select id="selectStuckOrders" resultType="com.web3.txsentry.entity.WithdrawOrder">
         SELECT id, biz_order_id as bizOrderId, to_address as toAddress, token_address as tokenAddress,
                amount, status, tx_hash as txHash, nonce, create_time as createTime, update_time as updateTime
@@ -44,17 +61,51 @@
             update_time = NOW()
         WHERE biz_order_id = #{bizOrderId}
     </update>
-    <select id="selectByStatus" resultType="com.web3.txsentry.entity.WithdrawOrder">
-        select id,
+
+    <select id="selectPendingBatchOrdersWithLock" resultType="com.web3.txsentry.entity.WithdrawOrder">
+        SELECT id,
                biz_order_id as bizOrderId,
                to_address as toAddress,
+               token_address as tokenAddress,
                amount,
-               status,
-               tx_hash as txHash,
-               nonce,
-               create_time as createTime,
-               update_time as updateTime
-        from withdraw_order
-        where status = #{status}
+               status
+        FROM withdraw_order
+        WHERE status = 'PENDING_BATCH'
+        ORDER BY create_time ASC
+        LIMIT #{limit}
+        FOR UPDATE SKIP LOCKED
     </select>
+
+    <update id="updateStatusBatch">
+        UPDATE withdraw_order
+        SET status = #{newStatus},
+        update_time = NOW()
+        WHERE biz_order_id IN
+        <foreach item="id" collection="bizOrderIds" open="(" separator="," close=")">
+            #{id}
+        </foreach>
+    </update>
+
+    <update id="batchUpdateToBroadcasted">
+        UPDATE withdraw_order
+        SET status = 'BROADCASTED',
+        tx_hash = #{txHash},
+        update_time = NOW()
+        WHERE biz_order_id IN
+        <foreach item="id" collection="bizOrderIds" open="(" separator="," close=")">
+            #{id}
+        </foreach>
+    </update>
+    <insert id="insertOrder" parameterType="com.web3.txsentry.entity.WithdrawOrder" useGeneratedKeys="true" keyProperty="id">
+        insert into withdraw_order (biz_order_id, to_address, token_address, amount, is_urgent, status, create_time, update_time)
+        values (#{bizOrderId}, #{toAddress}, #{tokenAddress}, #{amount}, #{isUrgent}, #{status}, NOW(), NOW())
+    </insert>
+
+    <update id="recoverZombieProcessingOrders">
+        UPDATE withdraw_order
+        SET status = 'PENDING_BATCH',
+            update_time = NOW()
+        WHERE status = 'PROCESSING_BATCH'
+          AND update_time &lt; NOW() - INTERVAL '5 MINUTE'
+    </update>
 </mapper>
