@@ -6,16 +6,19 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 import org.web3j.protocol.Web3j;
-import org.web3j.protocol.core.methods.response.EthGetTransactionReceipt;
 import org.web3j.protocol.core.methods.response.TransactionReceipt;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
- * scheduled job to monitor the on-chain status of broadcasted transactions.
- * bridges the gap between the asynchronous mempool and our local citus database.
+ * 工业级异步链上对账引擎。
+ * 适配混合路由架构（单发/聚合），通过 TxHash 分组大幅削减 RPC 请求，
+ * 仅依赖 Receipt 的 0x1/0x0 状态进行冷酷决断。
  */
 @Slf4j
 @Component
@@ -32,59 +35,78 @@ public class TxMonitorJob {
     @Scheduled(fixedDelay = 15000)
     public void monitorBroadcastedTransactions() {
 
-        // 1. fetch all orders currently in 'BROADCASTED' state.
-        // architectural note: this query lacks the shard key (biz_order_id),
-        // meaning citus will execute a scatter-gather query across all worker nodes.
-        // this is generally acceptable for background worker threads, but not for high-tps apis.
-        List<WithdrawOrder> pendingOrders = withdrawMapper.selectByStatus("BROADCASTED");
+        // 1. 抓取所有处于已广播状态的订单
+        List<WithdrawOrder> broadcastedOrders = withdrawMapper.selectByStatus("BROADCASTED");
 
-        if (pendingOrders.isEmpty()) {
-            return; // no pending transactions, sleep until next cycle
+        if (broadcastedOrders.isEmpty()) {
+            return;
         }
 
-        log.info("found {} transactions in BROADCASTED state, checking on-chain receipts...", pendingOrders.size());
+        // 2. 【核心重构】：按 TxHash 进行物理分组
+        // 无论这是单发的 1 个订单，还是聚合打包的 50 个订单，它们在内存里都会被归拢到一个 TxHash 下
+        Map<String, List<WithdrawOrder>> ordersByTxHash = broadcastedOrders.stream()
+                .filter(order -> order.getTxHash() != null)
+                .collect(Collectors.groupingBy(WithdrawOrder::getTxHash));
 
-        for (WithdrawOrder order : pendingOrders) {
-            checkOnChainStatus(order);
+        log.info("对账引擎启动：捞取到 {} 笔 BROADCASTED 订单，合并为 {} 个独立 TxHash 进行查证",
+                broadcastedOrders.size(), ordersByTxHash.size());
+
+        for (Map.Entry<String, List<WithdrawOrder>> entry : ordersByTxHash.entrySet()) {
+            String txHash = entry.getKey();
+            List<WithdrawOrder> associatedOrders = entry.getValue();
+
+            verifyAndSettle(txHash, associatedOrders);
         }
     }
 
-    private void checkOnChainStatus(WithdrawOrder order) {
-        String txHash = order.getTxHash();
-        String bizOrderId = order.getBizOrderId();
+    /**
+     * 对单一 TxHash 进行查证并批量结算
+     */
+    private void verifyAndSettle(String txHash, List<WithdrawOrder> associatedOrders) {
+
+        // 提取这批订单的业务 ID，用于批量更新
+        List<String> bizOrderIds = associatedOrders.stream()
+                .map(WithdrawOrder::getBizOrderId)
+                .collect(Collectors.toList());
 
         try {
-            // 2. query the ethereum node for the transaction receipt
-            EthGetTransactionReceipt receiptResponse = web3j.ethGetTransactionReceipt(txHash).send();
-            Optional<TransactionReceipt> receiptOpt = receiptResponse.getTransactionReceipt();
+            // 3. 极其克制的网络请求：每个 TxHash 只查一次以太坊节点！
+            Optional<TransactionReceipt> receiptOpt = web3j.ethGetTransactionReceipt(txHash).send().getTransactionReceipt();
 
-            if (receiptOpt.isPresent()) {
-                TransactionReceipt receipt = receiptOpt.get();
+            if (receiptOpt.isEmpty()) {
+                // 内存池排队中，尚未出块，跳过等待下次轮询
+                return;
+            }
 
-                // 3. parse the exact on-chain execution status
-                // "0x1" means the transaction was executed successfully.
-                // "0x0" means it reverted (e.g., out of gas, contract execution failed).
-                String onChainStatus = receipt.getStatus();
+            TransactionReceipt receipt = receiptOpt.get();
+            String status = receipt.getStatus();
 
-                if ("0x1".equals(onChainStatus)) {
-                    log.info("tx {} confirmed successfully. updating order {}.", txHash, bizOrderId);
-                    // crucial: state modification MUST route via bizOrderId
-                    withdrawMapper.updateStatusAndTxHash(bizOrderId, "SUCCESS", txHash);
+            // 4. 冷酷的状态决断
+            if ("0x1".equals(status)) {
+                // 交易成功：复用现有的 updateStatusBatch 方法，瞬间完结这批订单
+                settleOrders(bizOrderIds, "SUCCESS");
+                log.info("对账成功 [0x1]！TxHash: {}，已完结 {} 笔订单", txHash, bizOrderIds.size());
 
-                } else if ("0x0".equals(onChainStatus)) {
-                    log.error("tx {} failed on-chain (reverted). updating order {}.", txHash, bizOrderId);
-                    // crucial: state modification MUST route via bizOrderId
-                    withdrawMapper.updateStatusAndTxHash(bizOrderId, "FAILED", txHash);
-                }
+            } else if ("0x0".equals(status)) {
+                // 交易回滚：极度危险的信号
+                // 如果是聚合订单，意味着 50 个人全部失败。这里直接标记为 FAILED，交由人工或上游重试
+                settleOrders(bizOrderIds, "FAILED");
+                log.error("对账失败 [0x0] (Reverted)！TxHash: {}，导致 {} 笔订单全部失败", txHash, bizOrderIds.size());
+
             } else {
-                // 4. receipt is not present. the transaction is still pending in the mempool.
-                // we do nothing and wait for the next cron job cycle.
-                log.debug("tx {} is still pending in the mempool...", txHash);
+                log.warn("未知的 Receipt 状态: {} for TxHash: {}", status, txHash);
             }
 
         } catch (Exception e) {
-            log.error("network error while querying receipt for txHash: {}", txHash, e);
-            // do not change database status on network errors; retry on next cycle.
+            log.error("查证 TxHash: {} 遇到网络异常", txHash, e);
         }
+    }
+
+    /**
+     * 包装一层事务，确保同批订单的状态跃迁是原子性的
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public void settleOrders(List<String> bizOrderIds, String finalStatus) {
+        withdrawMapper.updateStatusBatch(bizOrderIds, finalStatus);
     }
 }
