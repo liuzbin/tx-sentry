@@ -1,7 +1,9 @@
 package com.web3.txsentry.job;
 
+import com.web3.txsentry.common.constant.TokenDictionary;
 import com.web3.txsentry.entity.WithdrawOrder;
 import com.web3.txsentry.mapper.citus.WithdrawOrderMapper;
+import com.web3.txsentry.service.execution.Web3TransactionEngine;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -12,171 +14,117 @@ import org.web3j.abi.datatypes.Address;
 import org.web3j.abi.datatypes.Function;
 import org.web3j.abi.datatypes.generated.Uint256;
 import org.web3j.crypto.Credentials;
-import org.web3j.crypto.RawTransaction;
-import org.web3j.crypto.TransactionEncoder;
-import org.web3j.protocol.Web3j;
-import org.web3j.protocol.core.methods.response.EthGasPrice;
-import org.web3j.protocol.core.methods.response.Transaction;
-import org.web3j.utils.Convert;
-import org.web3j.utils.Numeric;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.time.LocalDateTime;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.List;
-import java.util.Optional;
 
-/**
- * 工业级内存池监控与防卡死引擎。
- * 负责扫描长时间处于 BROADCASTED 状态的订单，并通过 Gas 提价覆盖 (Speed Up) 疏通 Nonce 拥堵。
- */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class StuckNonceMonitorJob {
 
     private final WithdrawOrderMapper withdrawMapper;
-    private final Web3j web3j;
+    private final Web3TransactionEngine web3Engine;
+    private final TokenDictionary tokenDictionary;
 
     @Value("${web3.wallet.private-key}")
     private String privateKey;
 
-    @Value("${web3.network.chain-id}")
-    private long chainId;
-
-    // 定义“卡死”的时间阈值，例如 15 分钟没有被打包，视为被内存池挂起
-    private static final int STUCK_THRESHOLD_MINUTES = 15;
-
     /**
-     * 每 3 分钟执行一次扫描
+     * 每 1 分钟执行一次高频雷达扫描
      */
-    @Scheduled(fixedDelay = 180000)
-    public void monitorAndSpeedUpStuckTransactions() {
-        LocalDateTime thresholdTime = LocalDateTime.now().minusMinutes(STUCK_THRESHOLD_MINUTES);
-
-        // 1. 查询超过阈值时间且依然处于 BROADCASTED 的订单
-        List<WithdrawOrder> stuckOrders = withdrawMapper.selectStuckOrders("BROADCASTED", thresholdTime);
-
-        if (stuckOrders.isEmpty()) {
-            return;
-        }
-
-        log.warn("检测到 {} 笔疑似卡死的交易，开始执行提价覆盖策略 (Speed Up)...", stuckOrders.size());
-
-        Credentials credentials = Credentials.create(privateKey);
-
-        for (WithdrawOrder order : stuckOrders) {
-            executeSpeedUp(order, credentials);
-        }
-    }
-
-    private void executeSpeedUp(WithdrawOrder order, Credentials credentials) {
-        String bizOrderId = order.getBizOrderId();
-        String oldTxHash = order.getTxHash();
-        long nonce = order.getNonce(); // 必须复用同一个 Nonce
-
+    @Scheduled(fixedDelay = 60000)
+    public void scanAndHealMempool() {
         try {
-            // 2. 去内存池里寻找这笔原交易，获取它当时的 Gas Price
-            Optional<Transaction> txOpt = web3j.ethGetTransactionByHash(oldTxHash).send().getTransaction();
-            if (txOpt.isEmpty()) {
-                // 防僵尸交易: 如果在内存池查不到，且距离上次广播已经超过 1小时,这意味着它 100% 被内存池物理清除了，必须立刻强行复活，否则整个 Nonce 队列死锁
-                java.time.Duration duration = java.time.Duration.between(order.getUpdateTime(), LocalDateTime.now());
-                if (duration.toMinutes() >= 60) {
-                    log.error("极度危险：订单 {} (Nonce: {}) 已在内存池彻底丢失超过 1 小时，触发僵尸交易强行复活协议！", bizOrderId, nonce);
-                    resuscitateZombieTransaction(order, credentials, nonce);
-                } else {
-                    // 如果还不到 1 小时，说明可能是刚出块导致内存池查不到，交由 TxMonitorJob 去查回执
-                    log.debug("内存池中未发现 txHash: {}，可能已出块，交由结算定时任务处理", oldTxHash);
+            Credentials credentials = Credentials.create(privateKey);
+            String hotWalletAddress = credentials.getAddress();
+
+            // 1. 获取链上目前正在死等的确切 Nonce (例如链上说：我正在等 Nonce = 100)
+            long expectedNonce = web3Engine.getNextExpectedChainNonce(hotWalletAddress);
+            log.info("自愈雷达扫描：链上目前阻塞在 Nonce = {}", expectedNonce);
+
+            // 2. 去数据库里寻找这条持有 Nonce 100 的记录
+            WithdrawOrder order = withdrawMapper.selectByNonce(expectedNonce);
+
+            if (order != null) {
+                // ==========================================
+                // 战法一：单子在数据库里！说明是网卡了或者 Gas 太低，执行 [提价重发 Speed Up]
+                // ==========================================
+                // 如果这个单子落库时间还没超过 5 分钟，说明可能还在正常排队，给它一点时间，不着急提价
+                if (order.getUpdateTime().isAfter(LocalDateTime.now().minusMinutes(5))) {
+                    return;
                 }
-                return;
+
+                log.warn("触发战法一：订单 {} (Nonce: {}) 卡顿超过 5 分钟，执行 EIP-1559 原单溢价重发", order.getBizOrderId(), expectedNonce);
+                executeSpeedUp(order, expectedNonce);
+
+            } else {
+                // ==========================================
+                // 战法二：单子不在数据库！幽灵空洞嫌疑出现，启动时间边界推断法
+                // ==========================================
+
+                // 去数据库查一查，有没有比 expectedNonce (100) 还要大的记录 (比如 101)？
+                WithdrawOrder nextOrder = withdrawMapper.selectNextNonceOrder(expectedNonce);
+
+                if (nextOrder != null) {
+                    // 找到了 101！检查 101 的创建时间，如果 101 已经是 3 分钟之前创建的了，那 100 绝对是死在内存里了！
+                    if (nextOrder.getCreateTime().isBefore(LocalDateTime.now().minusMinutes(3))) {
+                        log.error("触发战法二：幽灵 Nonce {} 确诊！后置单据 {} 已存活超 3 分钟。立即发射 0 ETH 空炮覆盖！", expectedNonce, nextOrder.getBizOrderId());
+                        executeCancelDrop(expectedNonce, hotWalletAddress);
+                    }
+                } else {
+                    // 如果连大于 100 的单子也没有，说明系统刚好就发到了 100，此时线程还在执行中，还没落库，安全等待即可。
+                    log.debug("Nonce {} 未查到记录，但也无后置记录，判断为正常业务延迟，暂不干预。", expectedNonce);
+                }
             }
-
-            Transaction pendingTx = txOpt.get();
-            if (pendingTx.getBlockNumber() != null) {
-                // 已经上链，不需要覆盖
-                return;
-            }
-
-            BigInteger oldGasPrice = pendingTx.getGasPrice();
-
-            // 3. 获取当前全网最新的 Gas Price
-            EthGasPrice ethGasPrice = web3j.ethGasPrice().send();
-            BigInteger currentNetworkGasPrice = ethGasPrice.getGasPrice();
-
-            // 4. 计算新的 Gas Price
-            // 取 oldGasPrice * 1.2 和 currentNetworkGasPrice 的最大值，确保一定能覆盖并迅速打包
-            BigInteger minRequiredGasPrice = new BigDecimal(oldGasPrice).multiply(new BigDecimal("1.2")).toBigInteger();
-            BigInteger newGasPrice = currentNetworkGasPrice.compareTo(minRequiredGasPrice) > 0
-                    ? currentNetworkGasPrice
-                    : minRequiredGasPrice;
-
-            log.info("订单 {} (Nonce: {}) 正在提价重发。旧 GasPrice: {}, 新 GasPrice: {}",
-                    bizOrderId, nonce, oldGasPrice, newGasPrice);
-            broadcastReplacement(order, nonce, newGasPrice, credentials);
         } catch (Exception e) {
-            log.error("执行提价覆盖时发生异常，订单: {}", bizOrderId, e);
+            log.error("自愈雷达运行异常", e);
         }
     }
 
     /**
-     * 僵尸交易强行复活
-     * 无视旧状态，直接取全网最新 Gas 并上浮 20%，强行覆盖那个死锁的 Nonce
+     * 执行战法一：原样提价
      */
-    private void resuscitateZombieTransaction(WithdrawOrder order, Credentials credentials, long nonce) throws Exception {
-        // 1. 获取全网当前最新 Gas Price
-        BigInteger currentNetworkGasPrice = web3j.ethGasPrice().send().getGasPrice();
+    private void executeSpeedUp(WithdrawOrder order, long nonce) {
+        try {
+            boolean isContractCall = order.getTokenAddress() != null && !order.getTokenAddress().isEmpty();
+            String payloadData = "";
+            BigInteger valueInWei = BigInteger.ZERO;
+            String toAddress = isContractCall ? order.getTokenAddress() : order.getToAddress();
 
-        // 2. 既然已经卡死 1 小时，说明网络极度拥堵。直接在当前网络价基础上再溢价 20%，确保一击必杀
-        BigInteger aggressiveGasPrice = new BigDecimal(currentNetworkGasPrice).multiply(new BigDecimal("1.2")).toBigInteger();
+            if (isContractCall) {
+                int decimals = tokenDictionary.getDecimals(order.getTokenAddress());
+                BigDecimal multiplier = BigDecimal.valueOf(Math.pow(10, decimals));
+                BigInteger tokenAmount = order.getAmount().multiply(multiplier).toBigInteger();
+                Function function = new Function("transfer", Arrays.asList(new Address(order.getToAddress()), new Uint256(tokenAmount)), Collections.emptyList());
+                payloadData = FunctionEncoder.encode(function);
+            } else {
+                valueInWei = org.web3j.utils.Convert.toWei(order.getAmount(), org.web3j.utils.Convert.Unit.ETHER).toBigInteger();
+            }
 
-        log.info("正在使用极度激进的 GasPrice {} 复活僵尸订单 {}", aggressiveGasPrice, order.getBizOrderId());
+            // 调用引擎开后门，isCancel = false
+            String newTxHash = web3Engine.executeSpeedUpOrCancel(toAddress, valueInWei, payloadData, isContractCall, nonce, false);
+            withdrawMapper.updateTxHashForSpeedUp(order.getBizOrderId(), newTxHash);
+            log.info("订单 {} 原单提价成功，新 TxHash: {}", order.getBizOrderId(), newTxHash);
 
-        // 3. 复用底层的广播逻辑
-        broadcastReplacement(order, nonce, aggressiveGasPrice, credentials);
+        } catch (Exception e) {
+            log.error("执行提价重发失败", e);
+        }
     }
 
     /**
-     * 重新构建交易报文，逻辑与 AsyncExecutor 保持绝对一致，但强制注入传入的 Nonce
+     * 执行战法二：发射空炮填充空洞
      */
-    private RawTransaction buildRawTransactionWithExactNonce(WithdrawOrder order, long nonce, BigInteger gasPrice) {
-        String tokenAddress = order.getTokenAddress();
-        String toAddress = order.getToAddress();
-
-        if (tokenAddress == null || tokenAddress.trim().isEmpty()) {
-            BigInteger valueInWei = Convert.toWei(order.getAmount(), Convert.Unit.ETHER).toBigInteger();
-            return RawTransaction.createEtherTransaction(BigInteger.valueOf(nonce), gasPrice, BigInteger.valueOf(21000L), toAddress, valueInWei);
-        } else {
-            int tokenDecimals = 6;
-            BigDecimal multiplier = BigDecimal.valueOf(Math.pow(10, tokenDecimals));
-            BigInteger tokenAmount = order.getAmount().multiply(multiplier).toBigInteger();
-
-            Function function = new Function("transfer", Arrays.asList(new Address(toAddress), new Uint256(tokenAmount)), Collections.emptyList());
-            String encodedFunction = FunctionEncoder.encode(function);
-
-            // 提价重发时，GasLimit 给一个安全的宽松值
-            BigInteger gasLimit = BigInteger.valueOf(100000L);
-            return RawTransaction.createTransaction(BigInteger.valueOf(nonce), gasPrice, gasLimit, tokenAddress, BigInteger.ZERO, encodedFunction);
+    private void executeCancelDrop(long ghostNonce, String hotWalletAddress) {
+        try {
+            // 调用引擎开后门，发给自己，金额为 0，isCancel = true
+            String cancelTxHash = web3Engine.executeSpeedUpOrCancel(hotWalletAddress, BigInteger.ZERO, "", false, ghostNonce, true);
+            log.warn("幽灵 Nonce {} 已被空炮物理填平！拦截成功，疏通 TxHash: {}", ghostNonce, cancelTxHash);
+        } catch (Exception e) {
+            log.error("空炮发射失败，Nonce 依然堵塞", e);
         }
-    }
-
-    private void broadcastReplacement(WithdrawOrder order, long nonce, BigInteger newGasPrice, Credentials credentials) throws Exception {
-        RawTransaction newRawTransaction = buildRawTransactionWithExactNonce(order, nonce, newGasPrice);
-
-        byte[] signedMessage = TransactionEncoder.signMessage(newRawTransaction, chainId, credentials);
-        String newHexValue = Numeric.toHexString(signedMessage);
-
-        org.web3j.protocol.core.methods.response.EthSendTransaction ethSendTransaction =
-                web3j.ethSendRawTransaction(newHexValue).send();
-
-        if (ethSendTransaction.hasError()) {
-            log.error("订单 {} 覆盖广播失败: {}", order.getBizOrderId(), ethSendTransaction.getError().getMessage());
-            return;
-        }
-
-        String newTxHash = ethSendTransaction.getTransactionHash();
-        withdrawMapper.updateTxHashForSpeedUp(order.getBizOrderId(), newTxHash);
-        log.info("订单 {} 覆盖广播成功！新的 TxHash: {}", order.getBizOrderId(), newTxHash);
     }
 }

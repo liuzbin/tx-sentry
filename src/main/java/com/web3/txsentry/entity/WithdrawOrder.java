@@ -1,5 +1,6 @@
 package com.web3.txsentry.entity;
 
+import com.web3.txsentry.common.enums.WithdrawStatusEnum;
 import lombok.Data;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
@@ -7,14 +8,14 @@ import java.time.LocalDateTime;
 @Data
 public class WithdrawOrder {
     private Long id;
-    private String bizOrderId;      // 业务端传来的唯一订单号，用于对账
-    private String toAddress;       // 提现目标地址
-    private String tokenAddress;    // 如果非空，则表示提现的是代币，否则则为原生币
-    private BigDecimal amount;      // 提现金额
-    private Boolean isUrgent;       // 记录该笔订单的原始加急意图
-    private String status;          // 状态: PENDING, BROADCASTED, CONFIRMED, FAILED TODO: 更换为枚举
-    private String txHash;          // 链上交易哈希
-    private Long nonce;             // 该笔交易使用的 Nonce
+    private String bizOrderId;      // A unique order number used for reconciliation
+    private String toAddress;       // withdraw target address
+    private String tokenAddress;    // if null, withdraw tokens; or withdraw native coin
+    private BigDecimal amount;      // withdraw amount
+    private Boolean isUrgent;       // if urgent, fast single route; or slow batch route
+    private WithdrawStatusEnum status;          // staus: PENDING, BROADCASTED, CONFIRMED, FAILED
+    private String txHash;          // transaction hash code
+    private Long nonce;             // Nonce of the current transaction
     private LocalDateTime createTime;
     private LocalDateTime updateTime;
 }

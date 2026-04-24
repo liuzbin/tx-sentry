@@ -5,16 +5,76 @@
 <mapper namespace="com.web3.txsentry.mapper.citus.WithdrawOrderMapper">
 
     <insert id="insertOrder" parameterType="com.web3.txsentry.entity.WithdrawOrder" useGeneratedKeys="true" keyProperty="id">
-        insert into withdraw_order (biz_order_id, to_address, token_address, amount, status, create_time, update_time)
-        values (#{bizOrderId}, #{toAddress}, #{tokenAddress}, #{amount}, #{status}, NOW(), NOW())
+        insert into withdraw_order (biz_order_id, to_address, token_address, amount, is_urgent, status, create_time, update_time)
+        values (#{bizOrderId}, #{toAddress}, #{tokenAddress}, #{amount}, #{isUrgent}, #{status}, NOW(), NOW())
     </insert>
 
-    <update id="updateStatusAndTxHash">
-        update withdraw_order
-        set status = #{status},
-            tx_hash = #{txHash},
-            update_time = NOW()
-        where biz_order_id = #{bizOrderId}
+    <update id="updateBroadcastSuccess">
+        UPDATE withdraw_order
+        SET status = 'BROADCASTED',
+        tx_hash = #{txHash},
+        nonce = #{nonce},
+        update_time = NOW()
+        WHERE biz_order_id = #{bizOrderId}
+    </update>
+
+    <update id="updateFailedStatus">
+        UPDATE withdraw_order
+        SET status = #{status},
+        update_time = NOW()
+        WHERE biz_order_id = #{bizOrderId}
+    </update>
+
+
+    <update id="updateStatusBatch">
+        UPDATE withdraw_order
+        SET status = #{newStatus},
+        update_time = NOW()
+        WHERE biz_order_id IN
+        <foreach item="id" collection="bizOrderIds" open="(" separator="," close=")">
+            #{id}
+        </foreach>
+    </update>
+
+    <update id="batchUpdateToBroadcasted">
+        UPDATE withdraw_order
+        SET status = 'BROADCASTED',
+        tx_hash = #{txHash},
+        update_time = NOW()
+        WHERE biz_order_id IN
+        <foreach item="id" collection="bizOrderIds" open="(" separator="," close=")">
+            #{id}
+        </foreach>
+    </update>
+
+    <update id="recoverZombieProcessingOrders">
+        UPDATE withdraw_order
+        SET status = 'PENDING_BATCH',
+        update_time = NOW()
+        WHERE status = 'PROCESSING_BATCH'
+        AND update_time &lt; NOW() - INTERVAL '5 MINUTE'
+    </update>
+
+    <select id="selectByNonce" resultType="com.web3.txsentry.entity.WithdrawOrder">
+        SELECT *
+        FROM withdraw_order
+        WHERE nonce = #{nonce}
+        LIMIT 1
+    </select>
+
+    <select id="selectNextNonceOrder" resultType="com.web3.txsentry.entity.WithdrawOrder">
+        SELECT *
+        FROM withdraw_order
+        WHERE nonce > #{nonce}
+        ORDER BY nonce ASC
+        LIMIT 1
+    </select>
+
+    <update id="updateTxHashForSpeedUp">
+        UPDATE withdraw_order
+        SET tx_hash = #{newTxHash},
+        update_time = NOW()
+        WHERE biz_order_id = #{bizOrderId}
     </update>
 
     <select id="selectByBizOrderId" resultType="com.web3.txsentry.entity.WithdrawOrder">
@@ -55,13 +115,6 @@
           AND update_time &lt; #{thresholdTime}
     </select>
 
-    <update id="updateTxHashForSpeedUp">
-        UPDATE withdraw_order
-        SET tx_hash = #{newTxHash},
-            update_time = NOW()
-        WHERE biz_order_id = #{bizOrderId}
-    </update>
-
     <select id="selectPendingBatchOrdersWithLock" resultType="com.web3.txsentry.entity.WithdrawOrder">
         SELECT id,
                biz_order_id as bizOrderId,
@@ -76,36 +129,4 @@
         FOR UPDATE SKIP LOCKED
     </select>
 
-    <update id="updateStatusBatch">
-        UPDATE withdraw_order
-        SET status = #{newStatus},
-        update_time = NOW()
-        WHERE biz_order_id IN
-        <foreach item="id" collection="bizOrderIds" open="(" separator="," close=")">
-            #{id}
-        </foreach>
-    </update>
-
-    <update id="batchUpdateToBroadcasted">
-        UPDATE withdraw_order
-        SET status = 'BROADCASTED',
-        tx_hash = #{txHash},
-        update_time = NOW()
-        WHERE biz_order_id IN
-        <foreach item="id" collection="bizOrderIds" open="(" separator="," close=")">
-            #{id}
-        </foreach>
-    </update>
-    <insert id="insertOrder" parameterType="com.web3.txsentry.entity.WithdrawOrder" useGeneratedKeys="true" keyProperty="id">
-        insert into withdraw_order (biz_order_id, to_address, token_address, amount, is_urgent, status, create_time, update_time)
-        values (#{bizOrderId}, #{toAddress}, #{tokenAddress}, #{amount}, #{isUrgent}, #{status}, NOW(), NOW())
-    </insert>
-
-    <update id="recoverZombieProcessingOrders">
-        UPDATE withdraw_order
-        SET status = 'PENDING_BATCH',
-            update_time = NOW()
-        WHERE status = 'PROCESSING_BATCH'
-          AND update_time &lt; NOW() - INTERVAL '5 MINUTE'
-    </update>
 </mapper>

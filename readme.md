@@ -43,3 +43,28 @@ The blockchain mempool is a dark forest. TxSentry includes dedicated background 
 
 ---
 *Built with rigorous engineering standards for institutional digital asset management.*
+
+
+基于中心化交易所的的综合热钱包池模型 - 托管模式
+
+1.通过AOP实现以bizOrderId为key的分布式锁保证幂等性
+2.执行端和鉴权分离，执行端默认已经进行了鉴权，只对该orderId的操作负责
+3.通过输入isUrgent判断走单发快速通道还是走经济批量通道
+
+
+1.为什么原生ETH不走batch
+singleUSDT: 21000+40000~60000SSTORE
+50BatchUSDT: 21000+(40000~60000SSTORE)X50 SAVING 49X21000
+
+singleETH: 21000
+50BatchUSDT: 21000+(9000CALL)X50 SAVING 21000X49 - 9000X50 - for loop GAS
+如果有节点gas limit限制还会得不偿失
+
+Fallback/Receive机制：
+如果是代币，本质上是修改智能合约的账本，接收方是被动收钱；
+如果是ETH，如果接收方是智能合约，EVM会强制触发合约中的fallback()或receive()函数，控制权则短暂交给了接收方，容易被攻击
+
+ETH打包需要对齐各笔交易的精度，一丁点的差异就会导致失败
+
+
+RLock双重检测锁确保nonce在多线程下的正确递增

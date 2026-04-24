@@ -1,4 +1,4 @@
-package com.web3.txsentry.constant;
+package com.web3.txsentry.common.constant;
 
 import org.springframework.stereotype.Component;
 import java.util.Map;

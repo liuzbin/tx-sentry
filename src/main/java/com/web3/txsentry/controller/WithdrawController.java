@@ -1,13 +1,12 @@
 package com.web3.txsentry.controller;
 
-import com.web3.txsentry.annotation.Idempotent;
+import com.web3.txsentry.aop.annotation.Idempotent;
+import com.web3.txsentry.dto.ApiResponse;
 import com.web3.txsentry.dto.WithdrawRequest;
 import com.web3.txsentry.service.WithdrawService;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
-import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-
-import java.math.BigDecimal;
 
 @RestController
 @RequestMapping("/api/v1/withdraw")
@@ -16,26 +15,26 @@ public class WithdrawController {
 
     private final WithdrawService withdrawService;
 
+    /**
+     * Transaction execution layer
+     * Only handles transaction execution and responsible for orderId
+     */
     @PostMapping("/submit")
-    @Idempotent // 触发 Redis 去重锁
-    public ResponseEntity<String> submitWithdraw(
-            @RequestHeader("Biz-Order-Id") String bizOrderId,
-            @RequestBody WithdrawRequest request) {
+    @Idempotent // Check duplicate submission
+    public ApiResponse<String> submitWithdraw(
+            @Valid @RequestBody WithdrawRequest request) {
 
-        // 参数基础校验
-        if (request.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
-            return ResponseEntity.badRequest().body("Amount must be greater than zero");
+        try {
+            String result = withdrawService.processWithdrawal(
+                    request.getBizOrderId(),
+                    request.getToAddress(),
+                    request.getAmount(),
+                    request.getTokenAddress(),
+                    request.isUrgent()
+            );
+            return ApiResponse.success(result);
+        } catch (Exception e) {
+            return ApiResponse.error(400, e.getMessage());
         }
-
-        // 仅仅向核心中枢透传 request.isUrgent() 这个路由控制因子
-        String result = withdrawService.processWithdrawal(
-                bizOrderId,
-                request.getToAddress(),
-                request.getAmount(),
-                request.getTokenAddress(),
-                request.isUrgent()
-        );
-
-        return ResponseEntity.ok(result);
     }
 }

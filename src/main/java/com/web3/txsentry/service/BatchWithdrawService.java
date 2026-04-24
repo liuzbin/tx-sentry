@@ -1,94 +1,134 @@
 package com.web3.txsentry.service;
 
+import com.web3.txsentry.common.constant.TokenDictionary;
+import com.web3.txsentry.common.enums.WithdrawStatusEnum;
+import com.web3.txsentry.common.exception.EvmRejectionException;
+import com.web3.txsentry.dto.TxResult;
 import com.web3.txsentry.entity.WithdrawOrder;
 import com.web3.txsentry.mapper.citus.WithdrawOrderMapper;
+import com.web3.txsentry.service.execution.Web3TransactionEngine;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.web3j.abi.FunctionEncoder;
+import org.web3j.abi.datatypes.Address;
+import org.web3j.abi.datatypes.DynamicArray;
+import org.web3j.abi.datatypes.Function;
+import org.web3j.abi.datatypes.generated.Uint256;
 
-import java.util.List;
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.util.*;
 import java.util.stream.Collectors;
 
-/**
- * 工业级批量提现调度服务。
- * 核心职责：提供“短事务”支持，严格执行两阶段状态跃迁（Two-Phase State Mutation）。
- * 绝对防御法则：此类的任何 @Transactional 方法内，绝对不允许出现任何 Web3j 的 RPC 网络调用。
- */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class BatchWithdrawService {
 
     private final WithdrawOrderMapper withdrawMapper;
+    private final Web3TransactionEngine web3Engine;
+    private final TokenDictionary tokenDictionary;
+
+    @Value("${web3.dispenser-contract}")
+    private String dispenserContractAddress;
 
     /**
-     * 阶段一：极速上锁并跃迁状态 (短事务)
-     * 物理机制：利用数据库的 FOR UPDATE SKIP LOCKED 抢占当前没人处理的单子，
-     * 瞬间将状态从 PENDING_BATCH 改为 PROCESSING_BATCH，然后立刻提交事务释放行锁。
-     * * @param limit 本次最大抓取数量
-     * @return 成功锁定并接管的订单列表
+     *  Batch withdrawal service - Only tokens
      */
-    @Transactional(rollbackFor = Exception.class)
-    public List<WithdrawOrder> lockAndFetchPendingBatchOrders(int limit) {
+    public void executeBatchProcess() {
+        // 1. Seize and lock orders - short transactions
+        List<WithdrawOrder> processingOrders = lockAndFetchPendingBatchOrders(200);
+        if (processingOrders.isEmpty()) return;
 
-        // 1. 悲观锁抓取 PENDING_BATCH 订单 (遇到被别人锁住的行自动跳过，绝不阻塞等待)
-        List<WithdrawOrder> lockedOrders = withdrawMapper.selectPendingBatchOrdersWithLock(limit);
+        // 2. Group by TokenAddress = type of tokens
+        Map<String, List<WithdrawOrder>> groupedOrders = processingOrders.stream()
+                .collect(Collectors.groupingBy(WithdrawOrder::getTokenAddress));
 
-        if (lockedOrders.isEmpty()) {
-            return lockedOrders;
+        // 3. Traverse and execute
+        for (Map.Entry<String, List<WithdrawOrder>> entry : groupedOrders.entrySet()) {
+            String tokenAddress = entry.getKey();
+            List<WithdrawOrder> orders = entry.getValue();
+
+            // slice into 50/batch
+            for (int i = 0; i < orders.size(); i += 50) {
+                List<WithdrawOrder> batch = orders.subList(i, Math.min(i + 50, orders.size()));
+                processSingleBatch(tokenAddress, batch);
+            }
         }
+    }
 
-        // 2. 提取业务 ID 列表
-        List<String> bizOrderIds = lockedOrders.stream()
-                .map(WithdrawOrder::getBizOrderId)
+    /**
+     * Process one batch of tokens
+     */
+    private void processSingleBatch(String tokenAddress, List<WithdrawOrder> batch) {
+        List<String> bizOrderIds = batch.stream().map(WithdrawOrder::getBizOrderId).collect(Collectors.toList());
+
+        try {
+            // Build ABI Data
+            String encodedData = encodeBatchData(tokenAddress, batch);
+
+            // Call engine
+            TxResult result = web3Engine.executeTransaction(dispenserContractAddress, BigInteger.ZERO, encodedData, true);
+
+            // Confirm Broadcasted success
+            confirmBatchBroadcasted(bizOrderIds, result.getTxHash());
+
+        } catch (EvmRejectionException e) {
+            log.error("Batch broadcast clearly rejected by node for token {}, failing all orders in batch", tokenAddress, e);
+            // business failed: Request Denied
+            withdrawMapper.updateStatusBatch(bizOrderIds, WithdrawStatusEnum.FAILED);
+
+        } catch (Exception e) {
+            log.error("Network timeout or local system crash for token {}, reverting status to PENDING_BATCH", tokenAddress, e);
+            // system exception: System Error
+            revertOrdersToPending(bizOrderIds);
+        }
+    }
+
+    /**
+     * ABI coding logic
+     */
+    private String encodeBatchData(String tokenAddress, List<WithdrawOrder> batch) {
+        int decimals = tokenDictionary.getDecimals(tokenAddress);
+        BigDecimal multiplier = BigDecimal.valueOf(Math.pow(10, decimals));
+
+        List<Address> addresses = batch.stream().map(o -> new Address(o.getToAddress())).collect(Collectors.toList());
+        List<Uint256> amounts = batch.stream()
+                .map(o -> new Uint256(o.getAmount().multiply(multiplier).toBigInteger()))
                 .collect(Collectors.toList());
 
-        // 3. 立刻将状态跃迁为 PROCESSING_BATCH
-        // 这一步是防御的灵魂：事务提交后行锁消失，但状态变了，其他机器的定时任务依靠 WHERE status = 'PENDING_BATCH' 再也抓不到它们，完美防止双花。
-        withdrawMapper.updateStatusBatch(bizOrderIds, "PROCESSING_BATCH");
+        Function function = new Function("batchTransferToken",
+                Arrays.asList(new Address(tokenAddress), new DynamicArray<>(Address.class, addresses), new DynamicArray<>(Uint256.class, amounts)),
+                Collections.emptyList());
 
-        log.info("成功锁定并接管 {} 笔批量提现订单，状态已跃迁为 PROCESSING_BATCH", bizOrderIds.size());
-
-        return lockedOrders;
+        return FunctionEncoder.encode(function);
     }
 
-    /**
-     * 阶段二 (成功分支)：上链成功，绑定 TxHash (短事务)
-     * 当 BatchWithdrawJob 在内存中完成了极其耗时的 Gas 估算、签名、广播后，调用此方法落地结果。
-     * * @param bizOrderIds 本批次包含的业务订单号
-     * @param txHash      聚合打包产生的唯一母交易 Hash
-     */
     @Transactional(rollbackFor = Exception.class)
-    public void confirmBatchBroadcasted(List<String> bizOrderIds, String txHash) {
-        withdrawMapper.batchUpdateToBroadcasted(bizOrderIds, txHash);
-        log.info("聚合上链成功确认，{} 笔订单已死死绑定至母 TxHash: {}", bizOrderIds.size(), txHash);
-    }
-
-    /**
-     * 阶段二 (失败分支)：组装或上链崩溃，状态回滚，释放给下一次调度 (短事务)
-     * 如果在组装报文、请求 Infura 节点时发生任何异常，必须调用此方法，
-     * 将 PROCESSING_BATCH 退回 PENDING_BATCH，防止订单变成无人问津的死锁僵尸。
-     * * @param bizOrderIds 本批次包含的业务订单号
-     */
-    @Transactional(rollbackFor = Exception.class)
-    public void revertOrdersToPending(List<String> bizOrderIds) {
-        withdrawMapper.updateStatusBatch(bizOrderIds, "PENDING_BATCH");
-        log.warn("聚合上链遇阻，触发物理防御降级，{} 笔订单已回滚为 PENDING_BATCH 等待下次重试", bizOrderIds.size());
-    }
-
-    /**
-     * 灾难恢复：清理因为服务器宕机而变成僵尸的 PROCESSING_BATCH 订单。
-     * 将卡住超过 5 分钟的订单，重新打回 PENDING_BATCH 队列。
-     */
-    @Transactional(rollbackFor = Exception.class)
-    public void recoverZombieProcessingOrders() {
-        // 这里的 SQL 逻辑很简单，需要在 Mapper 中实现：
-        // UPDATE withdraw_order SET status = 'PENDING_BATCH', update_time = NOW()
-        // WHERE status = 'PROCESSING_BATCH' AND update_time < NOW() - INTERVAL 5 MINUTE
-        int recoveredCount = withdrawMapper.recoverZombieProcessingOrders();
-        if (recoveredCount > 0) {
-            log.warn("触发系统崩溃自愈机制！成功将 {} 笔死锁的 PROCESSING_BATCH 订单打回 PENDING 队列", recoveredCount);
+    public List<WithdrawOrder> lockAndFetchPendingBatchOrders(int limit) {
+        List<WithdrawOrder> orders = withdrawMapper.selectPendingBatchOrdersWithLock(limit);
+        if (!orders.isEmpty()) {
+            List<String> ids = orders.stream().map(WithdrawOrder::getBizOrderId).collect(Collectors.toList());
+            withdrawMapper.updateStatusBatch(ids, WithdrawStatusEnum.PROCESSING_BATCH);
         }
+        return orders;
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public void confirmBatchBroadcasted(List<String> ids, String txHash) {
+        withdrawMapper.batchUpdateToBroadcasted(ids, txHash);
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public void revertOrdersToPending(List<String> ids) {
+        withdrawMapper.updateStatusBatch(ids, WithdrawStatusEnum.PENDING_BATCH);
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public void recoverZombieOrders() {
+        withdrawMapper.recoverZombieProcessingOrders();
     }
 }

@@ -4,8 +4,7 @@ import com.web3.txsentry.entity.WithdrawOrder;
 import org.springframework.context.ApplicationEvent;
 
 /**
- * 单发提现事件。
- * 当订单被路由至 PENDING_SINGLE 快车道时触发。
+ * withdraw-single event
  */
 public class WithdrawSingleEvent extends ApplicationEvent {
 

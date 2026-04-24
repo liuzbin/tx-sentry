@@ -1,4 +1,4 @@
-package com.web3.txsentry.service;
+package com.web3.txsentry.service.execution;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -38,13 +38,12 @@ public class NonceService {
         String redisKey = NONCE_KEY_PREFIX + address.toLowerCase();
         RAtomicLong atomicNonce = redissonClient.getAtomicLong(redisKey);
 
-        // 1. cold start phase: if the nonce is not in redis, we must fetch it from the blockchain.
+        // 1. if nonce not exist in redis, get it from blockchain
         if (!atomicNonce.isExists()) {
             initializeNonceFromChain(address, atomicNonce);
         }
 
-        // 2. core magic: atomically get the current value and increment it by 1 in redis.
-        // this is executed entirely in the redis server's single-threaded engine.
+        // 2. if nonce exists, get it from redis directly and self-increment
         long assignedNonce = atomicNonce.getAndIncrement();
 
         log.info("assigned nonce {} for address {}", assignedNonce, address);
@@ -81,7 +80,6 @@ public class NonceService {
                 }
             }
         } finally {
-            // absolutely ensure the lock is released
             initLock.unlock();
         }
     }
